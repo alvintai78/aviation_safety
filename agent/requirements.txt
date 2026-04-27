@@ -1,0 +1,10 @@
+# Foundry v2 stack (Responses API via OpenAI SDK + Foundry agent endpoint).
+azure-ai-projects>=2.0.0
+azure-identity>=1.17.0
+azure-search-documents>=11.5.1
+openai>=2.0.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pyodbc>=5.1.0          # Microsoft ODBC Driver 18 for SQL Server, AAD AccessToken
+pydantic>=2.7.0
+python-dotenv>=1.0.1   # local dev only

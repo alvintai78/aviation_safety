@@ -1,0 +1,38 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID:-57bbd325-81fb-4c5f-adee-489263236d32}"
+RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-CAAS}"
+DEPLOYMENT_NAME="${FOUNDRY_DEPLOYMENT_NAME:-srgsib-20260418-171701}"
+MODEL_DEPLOYMENT="${AZURE_OPENAI_DEPLOYMENT:-gpt-5.2}"
+AGENT_NAME="${FOUNDRY_AGENT_NAME:-safety-intelligence-bot}"
+SEARCH_INDEX="${SEARCH_INDEX:-safety-docs}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+AGENT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENV_FILE="$AGENT_ROOT/.env.foundry"
+
+PROJECT_ENDPOINT="$(az deployment group show \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$DEPLOYMENT_NAME" \
+  --subscription "$SUBSCRIPTION_ID" \
+  --query properties.outputs.foundryProjectEndpoint.value \
+  -o tsv)"
+
+if [[ -z "$PROJECT_ENDPOINT" || "$PROJECT_ENDPOINT" == "null" ]]; then
+  echo "Unable to resolve foundryProjectEndpoint from deployment '$DEPLOYMENT_NAME'." >&2
+  exit 1
+fi
+
+cat > "$ENV_FILE" <<EOF
+AZURE_AI_PROJECT_ENDPOINT=$PROJECT_ENDPOINT
+AZURE_OPENAI_DEPLOYMENT=$MODEL_DEPLOYMENT
+FOUNDRY_AGENT_NAME=$AGENT_NAME
+SEARCH_INDEX=$SEARCH_INDEX
+AZURE_SUBSCRIPTION_ID=$SUBSCRIPTION_ID
+AZURE_RESOURCE_GROUP=$RESOURCE_GROUP
+FOUNDRY_DEPLOYMENT_NAME=$DEPLOYMENT_NAME
+EOF
+
+echo "Wrote $ENV_FILE"
+echo "AZURE_AI_PROJECT_ENDPOINT=$PROJECT_ENDPOINT"

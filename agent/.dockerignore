@@ -1,0 +1,9 @@
+__pycache__
+*.pyc
+.venv
+.env
+*.bak
+web/node_modules
+web/dist
+static
+.DS_Store
