@@ -1,0 +1,528 @@
+# Deploy the Safety Intelligence Bot Container App — Private + Managed Identity
+
+A step-by-step manual guide to deploy the agent **Container App** into its **own
+resource group and VNet**, fronted by an **Application Gateway** (the only public
+surface), reaching the existing **Foundry** backend (and, through it, **Synapse**)
+entirely over **Private Endpoints / VNet peering** using **Microsoft Entra ID +
+Managed Identity** — no API keys, no SAS, no SQL passwords.
+
+```
+            Internet
+               │  (HTTPS, public)
+        ┌──────▼───────┐
+        │ App Gateway  │   WAF_v2, public IP   ── app RG / app VNet (snet-agw)
+        └──────┬───────┘
+               │  (private, internal LB)
+        ┌──────▼───────┐
+        │ Container App│   internal ingress    ── app RG / app VNet (snet-aca)
+        │  (system MI) │
+        └──────┬───────┘
+               │  (Private Endpoint / peering, MI auth)
+        ┌──────▼───────┐
+        │   Foundry    │   srgsib-foundry      ── CAAS RG / srgsib-vnet (snet-pe)
+        └──────┬───────┘
+               │  (Private Endpoint, MI auth)
+        ┌──────▼───────┐
+        │   Synapse    │   caassynapse
+        └──────────────┘
+```
+
+> The agent's local tools (`nl2sql`, `doc_search`) also call **Synapse SQL**,
+> **AI Search**, and **ADLS** directly from the Container App. All of those
+> already have Private Endpoints in `srgsib-vnet`, so this guide **peers** the new
+> app VNet to `srgsib-vnet` and links the existing Private DNS zones — giving the
+> app private reachability to every backend without duplicating endpoints.
+
+---
+
+## 0. Prerequisites
+
+- Azure CLI ≥ 2.60, logged in: `az login`
+- The Foundry stack is already deployed (`srgsib-foundry`, `srgsib-prj`,
+  `srgsib-search`, `caassynapse`, `caasadlsv2`).
+- You can resolve/admin the existing `CAAS` resource group and `srgsib-vnet`.
+- A built container image for the agent (this guide builds it from
+  [agent/Dockerfile](../Dockerfile)).
+
+Enable the Container Apps CLI extension:
+
+```bash
+az extension add --name containerapp --upgrade
+az provider register --namespace Microsoft.App
+az provider register --namespace Microsoft.OperationalInsights
+az provider register --namespace Microsoft.ContainerRegistry
+```
+
+---
+
+## 1. Set working variables
+
+```bash
+# --- existing backend (CAAS) ---
+SUBSCRIPTION_ID="57bbd325-81fb-4c5f-adee-489263236d32"
+BACKEND_RG="CAAS"
+BACKEND_VNET="srgsib-vnet"
+FOUNDRY_NAME="srgsib-foundry"
+FOUNDRY_PROJECT="srgsib-prj"
+SEARCH_NAME="srgsib-search"
+ADLS_NAME="caasadlsv2"
+SYNAPSE_NAME="caassynapse"
+SYNAPSE_SQLPOOL="caasedms"
+
+# --- new app environment ---
+LOCATION="southeastasia"
+APP_RG="CAAS-APP"
+APP_VNET="srgsib-app-vnet"
+APP_VNET_CIDR="10.60.0.0/22"
+SNET_ACA="snet-aca";  SNET_ACA_CIDR="10.60.0.0/23"   # Container Apps (needs /23+)
+SNET_AGW="snet-agw";  SNET_AGW_CIDR="10.60.2.0/24"   # Application Gateway
+SNET_PE="snet-pe";    SNET_PE_CIDR="10.60.3.0/24"    # any app-local PEs
+
+ACR_NAME="srgsibappacr$RANDOM"                        # must be globally unique
+CAE_NAME="srgsib-app-cae"
+APP_NAME="srgsib-app"
+AGW_NAME="srgsib-app-agw"
+AGW_PIP="srgsib-app-agw-pip"
+LAW_NAME="srgsib-app-law"
+
+az account set --subscription "$SUBSCRIPTION_ID"
+```
+
+---
+
+## 2. Create the app resource group + VNet
+
+```bash
+az group create -n "$APP_RG" -l "$LOCATION"
+
+az network vnet create \
+  -g "$APP_RG" -n "$APP_VNET" -l "$LOCATION" \
+  --address-prefixes "$APP_VNET_CIDR" \
+  --subnet-name "$SNET_ACA" --subnet-prefixes "$SNET_ACA_CIDR"
+
+# Container Apps infra subnet must be delegated to Microsoft.App/environments
+az network vnet subnet update \
+  -g "$APP_RG" --vnet-name "$APP_VNET" -n "$SNET_ACA" \
+  --delegations Microsoft.App/environments
+
+# App Gateway subnet (dedicated, no delegation)
+az network vnet subnet create \
+  -g "$APP_RG" --vnet-name "$APP_VNET" -n "$SNET_AGW" \
+  --address-prefixes "$SNET_AGW_CIDR"
+
+# Private Endpoint subnet (disable PE network policies)
+az network vnet subnet create \
+  -g "$APP_RG" --vnet-name "$APP_VNET" -n "$SNET_PE" \
+  --address-prefixes "$SNET_PE_CIDR" \
+  --disable-private-endpoint-network-policies true
+```
+
+---
+
+## 3. Peer the app VNet to the backend VNet (private reachability)
+
+This lets the Container App route to the Private Endpoints already living in
+`srgsib-vnet` (Foundry, Search, ADLS, Synapse).
+
+```bash
+APP_VNET_ID=$(az network vnet show -g "$APP_RG" -n "$APP_VNET" --query id -o tsv)
+BACKEND_VNET_ID=$(az network vnet show -g "$BACKEND_RG" -n "$BACKEND_VNET" --query id -o tsv)
+
+az network vnet peering create \
+  -g "$APP_RG" -n app-to-backend --vnet-name "$APP_VNET" \
+  --remote-vnet "$BACKEND_VNET_ID" \
+  --allow-vnet-access --allow-forwarded-traffic
+
+az network vnet peering create \
+  -g "$BACKEND_RG" -n backend-to-app --vnet-name "$BACKEND_VNET" \
+  --remote-vnet "$APP_VNET_ID" \
+  --allow-vnet-access --allow-forwarded-traffic
+```
+
+> Verify both peerings show `peeringState = Connected`:
+> `az network vnet peering list -g "$APP_RG" --vnet-name "$APP_VNET" -o table`
+
+---
+
+## 4. Link the existing Private DNS zones to the app VNet
+
+Without this, the app resolves backend hostnames to public IPs (which are
+blocked). Link each `privatelink.*` zone that already exists in `CAAS`.
+
+```bash
+ZONES=(
+  privatelink.services.ai.azure.com
+  privatelink.openai.azure.com
+  privatelink.cognitiveservices.azure.com
+  privatelink.search.windows.net
+  privatelink.blob.core.windows.net
+  privatelink.dfs.core.windows.net
+  privatelink.sql.azuresynapse.net
+  privatelink.dev.azuresynapse.net
+)
+
+for z in "${ZONES[@]}"; do
+  az network private-dns link vnet create \
+    -g "$BACKEND_RG" -z "$z" \
+    -n "${APP_VNET}-link" -v "$APP_VNET_ID" -e false
+done
+```
+
+---
+
+## 5. Create a private Azure Container Registry (in the app RG)
+
+```bash
+az acr create -g "$APP_RG" -n "$ACR_NAME" -l "$LOCATION" \
+  --sku Premium --admin-enabled false \
+  --public-network-enabled true          # temporary, for the first image push
+
+ACR_ID=$(az acr show -g "$APP_RG" -n "$ACR_NAME" --query id -o tsv)
+ACR_LOGIN_SERVER=$(az acr show -g "$APP_RG" -n "$ACR_NAME" --query loginServer -o tsv)
+```
+
+### Build & push the image
+
+```bash
+# Build inside ACR (no local Docker needed). Run from the repo root.
+az acr build -r "$ACR_NAME" -t "safety-bot:v1" -f agent/Dockerfile agent
+```
+
+### Lock the registry down (private endpoint + disable public access)
+
+```bash
+az network private-endpoint create \
+  -g "$APP_RG" -n "${ACR_NAME}-pe" -l "$LOCATION" \
+  --vnet-name "$APP_VNET" --subnet "$SNET_PE" \
+  --private-connection-resource-id "$ACR_ID" \
+  --group-id registry --connection-name "${ACR_NAME}-conn"
+
+az network private-dns zone create -g "$APP_RG" -n privatelink.azurecr.io
+az network private-dns link vnet create \
+  -g "$APP_RG" -z privatelink.azurecr.io \
+  -n "${APP_VNET}-link" -v "$APP_VNET_ID" -e false
+az network private-endpoint dns-zone-group create \
+  -g "$APP_RG" --endpoint-name "${ACR_NAME}-pe" -n default \
+  --private-dns-zone privatelink.azurecr.io --zone-name registry
+
+# Now disable public access (pulls happen via PE + managed identity)
+az acr update -n "$ACR_NAME" --public-network-enabled false
+```
+
+> If `az acr build` must run after lock-down, use an ACR **dedicated agent pool**
+> in the VNet or build from a jumpbox VM with line-of-sight to the PE.
+
+---
+
+## 6. Create the Container Apps environment (VNet-injected, internal)
+
+```bash
+# Log Analytics for the environment (keyless)
+az monitor log-analytics workspace create \
+  -g "$APP_RG" -n "$LAW_NAME" -l "$LOCATION"
+LAW_ID=$(az monitor log-analytics workspace show -g "$APP_RG" -n "$LAW_NAME" --query customerId -o tsv)
+LAW_KEY=$(az monitor log-analytics workspace get-shared-keys -g "$APP_RG" -n "$LAW_NAME" --query primarySharedKey -o tsv)
+ACA_SUBNET_ID=$(az network vnet subnet show -g "$APP_RG" --vnet-name "$APP_VNET" -n "$SNET_ACA" --query id -o tsv)
+
+az containerapp env create \
+  -g "$APP_RG" -n "$CAE_NAME" -l "$LOCATION" \
+  --infrastructure-subnet-resource-id "$ACA_SUBNET_ID" \
+  --internal-only true \
+  --logs-workspace-id "$LAW_ID" --logs-workspace-key "$LAW_KEY"
+```
+
+> `--internal-only true` gives the environment an **internal** load balancer
+> (private IP only). Public access comes solely through App Gateway in Step 9.
+
+---
+
+## 7. Deploy the Container App (managed identity, internal ingress)
+
+```bash
+FOUNDRY_PROJECT_ENDPOINT="https://${FOUNDRY_NAME}.services.ai.azure.com/api/projects/${FOUNDRY_PROJECT}"
+
+az containerapp create \
+  -g "$APP_RG" -n "$APP_NAME" \
+  --environment "$CAE_NAME" \
+  --image "${ACR_LOGIN_SERVER}/safety-bot:v1" \
+  --registry-server "$ACR_LOGIN_SERVER" \
+  --registry-identity system \
+  --system-assigned \
+  --ingress internal --target-port 8080 --transport auto \
+  --min-replicas 1 --max-replicas 3 \
+  --cpu 0.5 --memory 1Gi \
+  --env-vars \
+    AZURE_AI_PROJECT_ENDPOINT="$FOUNDRY_PROJECT_ENDPOINT" \
+    AZURE_OPENAI_ENDPOINT="https://${FOUNDRY_NAME}.openai.azure.com" \
+    AZURE_OPENAI_DEPLOYMENT="gpt-5.2" \
+    AZURE_OPENAI_EMBED_DEPLOYMENT="text-embedding-3-large" \
+    AZURE_OPENAI_API_VERSION="2025-04-01-preview" \
+    SEARCH_ENDPOINT="https://${SEARCH_NAME}.search.windows.net" \
+    SEARCH_INDEX="safety-docs" \
+    SYNAPSE_SQL_SERVER="${SYNAPSE_NAME}.sql.azuresynapse.net" \
+    SYNAPSE_SQL_DATABASE="${SYNAPSE_SQLPOOL}" \
+    ADLS_ACCOUNT="$ADLS_NAME" \
+    ADLS_DOCS_FILESYSTEM="docs"
+
+APP_MI=$(az containerapp show -g "$APP_RG" -n "$APP_NAME" --query identity.principalId -o tsv)
+echo "Container App MI principalId: $APP_MI"
+```
+
+> `--target-port 8080` matches the container's listening port (`uvicorn ... --port
+> 8080` / `EXPOSE 8080` in [agent/Dockerfile](../Dockerfile)). App Gateway still
+> talks to the Container App's internal FQDN over HTTPS 443; ingress maps that to
+> 8080 inside the container.
+
+---
+
+## 8. Grant the Container App managed identity its RBAC (no keys)
+
+```bash
+FOUNDRY_ID=$(az cognitiveservices account show -g "$BACKEND_RG" -n "$FOUNDRY_NAME" --query id -o tsv)
+SEARCH_ID=$(az search service show -g "$BACKEND_RG" -n "$SEARCH_NAME" --query id -o tsv)
+ADLS_ID=$(az storage account show -g "$BACKEND_RG" -n "$ADLS_NAME" --query id -o tsv)
+
+# Foundry Agent Service caller + direct AOAI/embeddings
+# NOTE: "Azure AI User" is not present in every tenant. If you get
+# "Role 'Azure AI User' doesn't exist", use "Azure AI Developer" (used here),
+# which grants the data-plane actions to call/run Foundry agents.
+az role assignment create --assignee-object-id "$APP_MI" --assignee-principal-type ServicePrincipal \
+  --role "Azure AI Developer" --scope "$FOUNDRY_ID"
+az role assignment create --assignee-object-id "$APP_MI" --assignee-principal-type ServicePrincipal \
+  --role "Cognitive Services OpenAI User" --scope "$FOUNDRY_ID"
+
+# AI Search (read indexes for doc_search)
+az role assignment create --assignee-object-id "$APP_MI" --assignee-principal-type ServicePrincipal \
+  --role "Search Index Data Reader" --scope "$SEARCH_ID"
+
+# ADLS (read regulatory docs)
+az role assignment create --assignee-object-id "$APP_MI" --assignee-principal-type ServicePrincipal \
+  --role "Storage Blob Data Reader" --scope "$ADLS_ID"
+
+# ACR pull (image)
+az role assignment create --assignee-object-id "$APP_MI" --assignee-principal-type ServicePrincipal \
+  --role "AcrPull" --scope "$ACR_ID"
+```
+
+---
+
+## 9. Grant the managed identity access to Synapse SQL (for nl2sql)
+
+Connect to the Synapse Dedicated SQL pool **as an Entra admin** (via Synapse
+Studio over its Private Endpoint, or a jumpbox with `sqlcmd`) and run:
+
+```sql
+CREATE USER [srgsib-app] FROM EXTERNAL PROVIDER;
+-- Dedicated SQL pool does NOT support "ALTER ROLE ... ADD MEMBER";
+-- use the legacy stored procedure instead.
+EXEC sp_addrolemember 'db_datareader', 'srgsib-app';
+-- grant EXECUTE on specific procs/schemas if your nl2sql tool needs them
+```
+
+> `[srgsib-app]` is the Container App's name (its managed identity). Adjust if you
+> renamed `APP_NAME`.
+
+---
+
+## 10. Deploy the Application Gateway (the only public surface)
+
+```bash
+AGW_SUBNET_ID=$(az network vnet subnet show -g "$APP_RG" --vnet-name "$APP_VNET" -n "$SNET_AGW" --query id -o tsv)
+
+# Public IP (Standard, static) — the single internet entry point
+az network public-ip create \
+  -g "$APP_RG" -n "$AGW_PIP" -l "$LOCATION" \
+  --sku Standard --allocation-method Static
+
+# Container App internal FQDN = App Gateway backend target
+APP_FQDN=$(az containerapp show -g "$APP_RG" -n "$APP_NAME" --query properties.configuration.ingress.fqdn -o tsv)
+echo "Backend FQDN: $APP_FQDN"
+
+# WAF policy is REQUIRED for the WAF_v2 SKU. Create it first; it ships with the
+# OWASP 3.2 managed rule set (Detection mode by default — switched to Prevention
+# in the lockdown step below).
+az network application-gateway waf-policy create \
+  -g "$APP_RG" -n "${AGW_NAME}-waf" -l "$LOCATION"
+
+az network application-gateway create \
+  -g "$APP_RG" -n "$AGW_NAME" -l "$LOCATION" \
+  --sku WAF_v2 --capacity 2 \
+  --vnet-name "$APP_VNET" --subnet "$SNET_AGW" \
+  --public-ip-address "$AGW_PIP" \
+  --servers "$APP_FQDN" \
+  --http-settings-port 443 --http-settings-protocol Https \
+  --frontend-port 80 \
+  --waf-policy "${AGW_NAME}-waf" \
+  --priority 100
+```
+
+> **Why frontend port 80 here?** `az ... application-gateway create` makes the
+> frontend listener **HTTP** unless you also pass a certificate. An HTTP listener
+> on 443 is rejected (`ApplicationGatewayPortNotValidForProtocol`). So we bootstrap
+> the gateway on HTTP/80 and add the real **HTTPS/443** listener + cert in the
+> friendly-domain step below. (`--http-settings-*` is the *backend* leg to the
+> Container App and stays HTTPS/443.) If you already have the PFX, you can instead
+> create with `--frontend-port 443 --cert-file ./your.pfx --cert-password "<pwd>"`.
+
+### Backend health probe + host header (point to the internal FQDN)
+
+```bash
+# Custom probe using the backend FQDN as host
+az network application-gateway probe create \
+  -g "$APP_RG" --gateway-name "$AGW_NAME" -n aca-probe \
+  --protocol Https --host "$APP_FQDN" --path / \
+  --interval 30 --timeout 30 --threshold 3
+
+az network application-gateway http-settings update \
+  -g "$APP_RG" --gateway-name "$AGW_NAME" -n appGatewayBackendHttpSettings \
+  --host-name "$APP_FQDN" --probe aca-probe \
+  --protocol Https --port 443
+```
+
+> **TLS:** add an HTTPS listener with your own certificate
+> (`az network application-gateway ssl-cert create ...`) and bind the rule to it.
+> For a quick test you can use an HTTP listener on port 80 instead, but production
+> should terminate TLS at the gateway. The Container App's internal ingress already
+> serves HTTPS on its `*.azurecontainerapps.io` FQDN, which Azure DNS resolves to
+> the internal LB IP from inside the app VNet.
+
+### (Optional) Give it a friendly public domain (e.g. `srgsib-app.caasapp.gov.sg`)
+
+The friendly name lives on the **App Gateway** (the public surface), not on the
+Container App. Users hit `https://srgsib-app.caasapp.gov.sg`; the gateway still
+forwards privately to the internal container app FQDN. Three pieces: a **DNS
+record**, a **TLS cert**, and an **HTTPS listener** bound to that hostname.
+
+```bash
+FRIENDLY_FQDN="srgsib-app.caasapp.gov.sg"
+DNS_RG="<rg-hosting-the-dns-zone>"        # only if the zone is in Azure DNS
+DNS_ZONE="caasapp.gov.sg"
+
+# 1. DNS: point the friendly name at the App Gateway public IP.
+AGW_IP=$(az network public-ip show -g "$APP_RG" -n "$AGW_PIP" --query ipAddress -o tsv)
+echo "Create an A record: $FRIENDLY_FQDN -> $AGW_IP"
+# If the zone is hosted in Azure DNS:
+az network dns record-set a add-record \
+  -g "$DNS_RG" -z "$DNS_ZONE" -n srgsib-app -a "$AGW_IP"
+# Otherwise create the A record in your gov.sg DNS provider manually.
+
+# 2. Upload the TLS cert for that hostname (PFX with private key).
+az network application-gateway ssl-cert create \
+  -g "$APP_RG" --gateway-name "$AGW_NAME" -n srgsib-cert \
+  --cert-file ./srgsib-app.caasapp.gov.sg.pfx --cert-password "<pfx-password>"
+
+# 3. Add a 443 frontend port (the gateway was bootstrapped on 80), then an
+#    HTTPS listener bound to the cert + friendly hostname, routed to the
+#    existing backend pool (the internal container app).
+az network application-gateway frontend-port create \
+  -g "$APP_RG" --gateway-name "$AGW_NAME" -n https-port --port 443
+
+POOL=$(az network application-gateway address-pool list \
+  -g "$APP_RG" --gateway-name "$AGW_NAME" --query "[0].name" -o tsv)
+
+az network application-gateway http-listener create \
+  -g "$APP_RG" --gateway-name "$AGW_NAME" -n friendly-listener \
+  --frontend-port https-port --ssl-cert srgsib-cert \
+  --host-name "$FRIENDLY_FQDN"
+
+az network application-gateway rule create \
+  -g "$APP_RG" --gateway-name "$AGW_NAME" -n friendly-rule \
+  --http-listener friendly-listener \
+  --address-pool "$POOL" --http-settings appGatewayBackendHttpSettings \
+  --priority 90
+```
+
+> The backend HTTP settings still use `--host-name "$APP_FQDN"` (the internal
+> ACA FQDN) so the probe and SNI to the Container App stay valid — only the
+> *public-facing* listener uses the friendly name. `gov.sg` domains must be
+> registered/delegated through the proper process, and the cert should be issued
+> by a trusted/government CA.
+
+
+
+```bash
+# Set the attached WAF policy to Prevention mode (WAF_v2 uses a policy, not the
+# legacy inline waf-config). The OWASP 3.2 managed rule set is already attached.
+az network application-gateway waf-policy policy-setting update \
+  -g "$APP_RG" --policy-name "${AGW_NAME}-waf" \
+  --state Enabled --mode Prevention
+
+# Restrict the AGW subnet inbound to HTTPS + the GatewayManager health ports
+az network nsg create -g "$APP_RG" -n "${SNET_AGW}-nsg" -l "$LOCATION"
+az network nsg rule create -g "$APP_RG" --nsg-name "${SNET_AGW}-nsg" -n allow-https \
+  --priority 100 --direction Inbound --access Allow --protocol Tcp \
+  --source-address-prefixes Internet --destination-port-ranges 443
+az network nsg rule create -g "$APP_RG" --nsg-name "${SNET_AGW}-nsg" -n allow-gwmgr \
+  --priority 110 --direction Inbound --access Allow --protocol Tcp \
+  --source-address-prefixes GatewayManager --destination-port-ranges 65200-65535
+az network vnet subnet update -g "$APP_RG" --vnet-name "$APP_VNET" -n "$SNET_AGW" \
+  --network-security-group "${SNET_AGW}-nsg"
+```
+
+---
+
+## 11. Register the Foundry agent
+
+From a host with line-of-sight to the Foundry Private Endpoint (jumpbox in the
+VNet, or after the peering above from the app subnet):
+
+```bash
+source .venv/bin/activate
+python agent/scripts/create_foundry_agent.py   # uses AZURE_AI_PROJECT_ENDPOINT
+```
+
+---
+
+## 12. Load RAG data (one-time)
+
+```bash
+# Upload regulatory PDFs to ADLS 'docs' container (AAD auth, no keys)
+az storage fs create -n docs --account-name "$ADLS_NAME" --auth-mode login
+az storage fs directory upload -f docs --account-name "$ADLS_NAME" \
+  --auth-mode login -s ./regulatory-docs -d / --recursive
+
+# Build the 'safety-docs' AI Search index from inside the VNet
+# (run your index build script with line-of-sight to the Search PE)
+```
+
+---
+
+## 13. Validate end-to-end
+
+```bash
+# 1. Gateway is up and healthy
+az network application-gateway show-backend-health \
+  -g "$APP_RG" -n "$AGW_NAME" -o table
+
+# 2. Public entry point
+AGW_IP=$(az network public-ip show -g "$APP_RG" -n "$AGW_PIP" --query ipAddress -o tsv)
+curl -sk "https://$AGW_IP/healthz"     # or your app's health path
+
+# 3. App logs
+az containerapp logs show -g "$APP_RG" -n "$APP_NAME" --tail 50
+```
+
+Confirm the lockdown:
+
+- Container App ingress = `internal` (no public FQDN reachable from internet).
+- App Gateway public IP is the **only** internet-facing endpoint.
+- No API keys / connection strings in env vars — only endpoints + deployment names.
+- All backend calls (Foundry, Search, ADLS, Synapse) resolve to `privatelink`
+  addresses and authenticate with the Container App's managed identity.
+
+---
+
+## Resource summary
+
+| Resource | Name | RG | Public? |
+|---|---|---|---|
+| Resource group | `CAAS-APP` | — | — |
+| VNet | `srgsib-app-vnet` (`10.60.0.0/22`) | CAAS-APP | No |
+| Container Apps env | `srgsib-app-cae` (internal) | CAAS-APP | No |
+| Container App | `srgsib-app` (system MI) | CAAS-APP | No |
+| Container Registry | `srgsibappacr*` (Premium, PE) | CAAS-APP | No |
+| Application Gateway | `srgsib-app-agw` (WAF_v2) | CAAS-APP | **Yes (only)** |
+| Public IP | `srgsib-app-agw-pip` | CAAS-APP | **Yes** |
+| Log Analytics | `srgsib-app-law` | CAAS-APP | No |
+| VNet peering | app-vnet ↔ srgsib-vnet | both | No |
+| Foundry / Search / Synapse / ADLS | existing | CAAS | No |
