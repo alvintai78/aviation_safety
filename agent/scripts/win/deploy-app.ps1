@@ -174,8 +174,11 @@ $envVars = @(
     "FOUNDRY_AGENT_NAME=$AgentName"
 )
 
-$appExists = az containerapp show -g $AppRg -n $AppName --query "name" -o tsv 2>$null
-$global:LASTEXITCODE = 0   # 'show' returns non-zero when the app is absent; that's expected here.
+# Use 'list' (not 'show'): it returns an empty result + exit 0 when the app is
+# absent, instead of 'show' which errors with ResourceNotFound and prints to
+# stderr. This keeps the existence probe quiet and non-fatal.
+$appExists = az containerapp list -g $AppRg --query "[?name=='$AppName'].name | [0]" -o tsv 2>$null
+$global:LASTEXITCODE = 0
 
 if ([string]::IsNullOrWhiteSpace($appExists)) {
     Write-Step "Creating Container App: $AppName"
