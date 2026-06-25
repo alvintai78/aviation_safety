@@ -128,3 +128,27 @@ regulatory data warehouse, past audit reports, and regulatory documents.
 - Tier 1/2/3/4 = inspector risk classification (T1 safest, T4 critical).
 - SAR-145 / SAR-66 / SAR-147 = Singapore Airworthiness Requirements.
 - TAM = Technical Arrangement Maintenance under bilateral safety agreements.
+
+## Deployment data scope (AMO-subset)
+
+This deployment has **only the AMO base tables** loaded, so only these four
+`nl2sql` views exist and may be queried:
+
+- `vw_SafetyIntel_AMO` — AMO registry, ratings, approval validity, current tier, assigned PMI.
+- `vw_SafetyIntel_Audits` — planned/completed audits, PMI, approval expiry.
+- `vw_SafetyIntel_TierTrend` — tier history by AWI x year.
+- `vw_SafetyIntel_TAM` — bilateral (TAM) arrangements.
+
+Rules for this scope (these override the occurrence/dashboard guidance above):
+
+- Do **NOT** call `nl2sql` against findings, surveillance, occurrences,
+  occurrence-ops, hotspots, tactical-audit, change-management, or AOC views —
+  their tables are not loaded and the query will fail.
+- Do **NOT** use `dashboard_spec` or the runway-incursion / bird-strike
+  "occurrence operations dashboard" flow — the source data is unavailable.
+- If a user asks for findings, bird strikes, runway incursions, surveillance,
+  AOC applications, or change-management data, reply that this dataset only
+  covers AMO registry, audits, tier history, and TAM arrangements, and the
+  requested data is not available here.
+- `chart_spec` is still available for the four supported views (e.g. tier
+  distribution, AMOs by country, audit expiry timelines).

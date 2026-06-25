@@ -272,3 +272,126 @@ FROM dbo.vw_SafetyIntel_TacticalAudit
 WHERE Activity_Code = 'Runway Incursion'
 ORDER BY Composite_Risk_Score DESC;
 ```
+
+---
+
+## AMO-subset deployment (only AMO base tables loaded)
+
+> Use this section ONLY when the deployment has just the five AMO base tables
+> (`DM_TBL_SRG_AMO_MOA`, `DM_TBL_SRG_AMO_TIER`, `DM_TBL_SRG_AMO_ASSIGNED_PMI`,
+> `DM_TBL_SRG_AMO_AUDIT_TRACKING`, `DM_TBL_SRG_AMO_TAM_LIST`) and the trimmed
+> view script `SQL/vw_SafetyIntel_Views_AMO_Subset.sql`. In that case ONLY the
+> four views below exist.
+
+Available views in this deployment:
+
+```
+vw_SafetyIntel_AMO        (AWI, Organisation_Name, Country, City, Highest_Rating, Status, Bilateral_Arrangement, Initial_Issue_Date, Approval_From, Approval_To, Accountable_Manager, Quality_Manager, Tier_Year, Current_Tier, Assigned_PMI)
+vw_SafetyIntel_Audits     (AWI, Organisation_Name, Audit_Type, CAT, Country, City, Approval_Expiry_Date, Planned_Audit_Date, Completed_Audit_Date, Previous_Year_PMI, Current_Year_PMI, ESOMS_Reference_No, Remarks)
+vw_SafetyIntel_TierTrend  (AWI, Organisation_Name, Year, Tier, Highest_Rating)
+vw_SafetyIntel_TAM        (Organisation_Name, Foreign_Approval_Number, Type_of_Agreement, Country, Status)
+```
+
+Rules for this deployment:
+- Reference ONLY the four views above. Do NOT use the Findings, Surveillance,
+  Occurrences, OccurrenceOps, OccurrenceOpsOverview, OccurrenceHotspots,
+  TacticalAudit, ChangeMgmt, or AOC_Applications views — their base tables are
+  not loaded and any query against them will fail.
+- If the question needs that unavailable data (e.g. findings, bird strikes,
+  runway incursions, surveillance, AOC applications, change management), reply
+  that this dataset only covers AMO registry, audits, tier history, and TAM
+  bilateral arrangements, and the requested data is not available.
+
+### Example A1
+User: Show me the AMO profile for AWI/004.
+SQL:
+```sql
+SELECT TOP 1
+    AWI, Organisation_Name, Country, City, Highest_Rating, [Status],
+    Approval_From, Approval_To, Accountable_Manager, Quality_Manager,
+    Current_Tier, Tier_Year, Assigned_PMI
+FROM dbo.vw_SafetyIntel_AMO
+WHERE AWI = 'AWI/004';
+```
+
+### Example A2
+User: How many AMOs are there per country?
+SQL:
+```sql
+SELECT Country, COUNT(*) AS AMO_Count
+FROM dbo.vw_SafetyIntel_AMO
+GROUP BY Country
+ORDER BY AMO_Count DESC, Country;
+```
+
+### Example A3
+User: Which AMOs had a downward tier change between 2023 and 2024?
+SQL:
+```sql
+WITH t AS (
+    SELECT AWI, Organisation_Name,
+           MAX(CASE WHEN [Year] = 2023 THEN Tier END) AS Tier_2023,
+           MAX(CASE WHEN [Year] = 2024 THEN Tier END) AS Tier_2024
+    FROM dbo.vw_SafetyIntel_TierTrend
+    WHERE [Year] IN (2023, 2024)
+    GROUP BY AWI, Organisation_Name
+)
+SELECT TOP 200 AWI, Organisation_Name, Tier_2023, Tier_2024
+FROM t
+WHERE Tier_2023 IS NOT NULL AND Tier_2024 IS NOT NULL
+  AND Tier_2024 > Tier_2023;
+```
+
+### Example A4
+User: Current tier distribution across all AMOs.
+SQL:
+```sql
+SELECT Current_Tier, COUNT(*) AS AMO_Count
+FROM dbo.vw_SafetyIntel_AMO
+GROUP BY Current_Tier
+ORDER BY Current_Tier;
+```
+
+### Example A5
+User: Which AMO approvals expire in the next 6 months?
+SQL:
+```sql
+SELECT AWI, Organisation_Name, Approval_Expiry_Date, Audit_Type, Current_Year_PMI
+FROM dbo.vw_SafetyIntel_Audits
+WHERE Approval_Expiry_Date >= CAST(GETDATE() AS DATE)
+  AND Approval_Expiry_Date < DATEADD(MONTH, 6, CAST(GETDATE() AS DATE))
+ORDER BY Approval_Expiry_Date;
+```
+
+### Example A6
+User: Planned vs completed audits in 2025.
+SQL:
+```sql
+SELECT
+    SUM(CASE WHEN Planned_Audit_Date IS NOT NULL THEN 1 ELSE 0 END)   AS Planned_Audits,
+    SUM(CASE WHEN Completed_Audit_Date IS NOT NULL THEN 1 ELSE 0 END) AS Completed_Audits
+FROM dbo.vw_SafetyIntel_Audits
+WHERE YEAR(Planned_Audit_Date) = 2025
+   OR YEAR(Completed_Audit_Date) = 2025;
+```
+
+### Example A7
+User: List TAM bilateral arrangements by country.
+SQL:
+```sql
+SELECT Country, Type_of_Agreement, COUNT(*) AS Arrangement_Count
+FROM dbo.vw_SafetyIntel_TAM
+GROUP BY Country, Type_of_Agreement
+ORDER BY Arrangement_Count DESC, Country;
+```
+
+### Example A8
+User: Which inspectors (PMI) are assigned to the most AMOs?
+SQL:
+```sql
+SELECT TOP 10 Assigned_PMI, COUNT(*) AS AMO_Count
+FROM dbo.vw_SafetyIntel_AMO
+WHERE Assigned_PMI IS NOT NULL
+GROUP BY Assigned_PMI
+ORDER BY AMO_Count DESC, Assigned_PMI;
+```
