@@ -73,6 +73,18 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# PowerShell 7.4+ treats ANY non-zero native exit code as a terminating error when
+# $ErrorActionPreference = 'Stop'. We rely on explicit $LASTEXITCODE checks in
+# Invoke-Az instead, so disable that behavior. This also keeps benign az stderr
+# warnings (e.g. "behavior altered by extension: containerapp") from aborting the
+# run, and lets the 'az containerapp show' existence probe fail gracefully.
+if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
+
+# Reduce az log noise (only errors); keeps the transcript readable on Windows.
+$env:AZURE_CORE_ONLY_SHOW_ERRORS = "true"
+
 # Resolve repo paths relative to this script: scripts/win -> scripts -> agent -> repo
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AgentRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path          # ...\agent
@@ -163,6 +175,7 @@ $envVars = @(
 )
 
 $appExists = az containerapp show -g $AppRg -n $AppName --query "name" -o tsv 2>$null
+$global:LASTEXITCODE = 0   # 'show' returns non-zero when the app is absent; that's expected here.
 
 if ([string]::IsNullOrWhiteSpace($appExists)) {
     Write-Step "Creating Container App: $AppName"
