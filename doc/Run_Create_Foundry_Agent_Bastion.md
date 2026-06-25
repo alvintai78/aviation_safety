@@ -33,12 +33,35 @@ on the locked-down `srgsib-foundry` project.
   nslookup srgsib-foundry.services.ai.azure.com
   # expect a 10.x.x.x answer, NOT a public IP
   ```
-- Azure CLI installed and logged in as an identity that has **Azure AI Developer**
-  (or higher) on the Foundry project:
+- Azure CLI installed and logged in as an identity that has the **`Foundry User`**
+  role on the Foundry account (`srgsib-foundry`):
   ```bash
   az login            # or: az login --identity   (if using the host's MI)
   az account set --subscription 57bbd325-81fb-4c5f-adee-489263236d32
   ```
+  > **Important — which role?** In this tenant the newer built-in roles
+  > (`Azure AI User`, `Azure AI Developer`) are a **stale generation** and do
+  > **not** grant the data action the script needs
+  > (`Microsoft.CognitiveServices/accounts/AIServices/connections/read`).
+  > The role that works here is **`Foundry User`**, whose data actions are
+  > `Microsoft.CognitiveServices/*` (covers connection read, agent create, and
+  > inference).
+  >
+  > **Heads-up:** when you run from the Bastion with `az login --identity`, the
+  > script authenticates as the **VM's managed identity** (e.g. `vmwin11`), *not*
+  > your user. That managed identity is the principal that needs `Foundry User`.
+  > Grant it with:
+  > ```bash
+  > FID=$(az cognitiveservices account show -g CAAS -n srgsib-foundry --query id -o tsv)
+  > MI_OBJ_ID=<managed-identity-object-id>   # from the PermissionDenied error, or the VM's identity
+  > az role assignment create \
+  >   --assignee-object-id "$MI_OBJ_ID" \
+  >   --assignee-principal-type ServicePrincipal \
+  >   --role "Foundry User" \
+  >   --scope "$FID"
+  > ```
+  > Data-plane RBAC on Cognitive Services is cached — allow **5–10 minutes** for
+  > a new assignment to take effect before retrying.
 - Python 3.11+ and `git` available.
 
 ---
@@ -96,6 +119,10 @@ source .venv/bin/activate        # if not already active
 python agent/scripts/create_foundry_agent.py
 ```
 
+> If run into RBAC propagation issues, can run this command to refresh the token
+az account get-access-token --resource https://cognitiveservices.azure.com --output none
+python agent/scripts/create_foundry_agent.py
+
 > Run it with the explicit `python ...` form. The script's shebang points at a
 > non-existent `agent/.venv`; activating the repo-root `.venv` and calling
 > `python` avoids that.
@@ -139,7 +166,9 @@ You can also confirm it in the **Azure AI Foundry portal → srgsib-prj → Agen
 |---|---|---|
 | `AZURE_AI_PROJECT_ENDPOINT is missing or not https` | env not set | Recheck Step 3 (`agent/.env.foundry`). |
 | DNS resolves to a public IP / connection timeout | host has no private line-of-sight | Confirm the Bastion host is in (or peered to) `srgsib-vnet` and the `privatelink.services.ai.azure.com` zone is linked. |
-| `403` / `AuthorizationFailed` on the data-plane call | identity lacks role | Grant **Azure AI Developer** on the Foundry project to your `az login` identity. |
+| `(PermissionDenied) Principal does not have access to API/Operation` on `project.connections.list()` | the running principal lacks the right Foundry data-plane role (in this tenant `Azure AI User` / `Azure AI Developer` do **not** cover `AIServices/connections/read`) | Grant **`Foundry User`** on the `srgsib-foundry` account to the principal in the error. With `az login --identity` that principal is the **VM's managed identity**, not your user. See the role-assignment snippet in [Prerequisites](#0-prerequisites-on-the-bastion-host). |
+| Still `PermissionDenied` right after assigning `Foundry User` | data-plane RBAC propagation delay / cached token | Wait **5–10 minutes**, then re-run. If it persists, refresh the token: `az account get-access-token --resource https://cognitiveservices.azure.com --output none` and retry. |
+| Error shows a different principal/object id than expected | `DefaultAzureCredential` picked a different identity (e.g. wrong user-assigned MI) | Run `az login --identity`; if the VM has multiple user-assigned identities, assign `Foundry User` to the one in the error, or set the client id so `DefaultAzureCredential` selects it. |
 | `No Azure AI Search connection found on this project` | connection missing | It should exist as `srgsib-search-conn` from the Bicep; re-deploy Foundry if absent. |
 | ODBC / `pyodbc` build errors during `pip install` | missing system ODBC driver | Only needed for the app's `nl2sql` runtime, not for agent registration — you can install `msodbcsql18` later. |
 

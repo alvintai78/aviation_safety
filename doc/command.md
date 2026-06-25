@@ -1,0 +1,1 @@
+az network application-gateway start -g CAAS-APP -n srgsib-app-agw

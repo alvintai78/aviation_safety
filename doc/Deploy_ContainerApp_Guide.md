@@ -236,7 +236,19 @@ az containerapp env create \
 
 ---
 
-## 7. Deploy the Container App (managed identity, internal ingress)
+## 7. Deploy the Container App (managed identity, external ingress)
+
+> **IMPORTANT — use `--ingress external`, not `internal`.** The environment is
+> already **internal-only** (Step 6, `--internal-only true`), so the app has **no
+> public exposure** either way — its FQDN resolves only to the env's private load
+> balancer. The `external` flag controls whether the app is **published on the
+> environment's load-balancer frontend** (the static IP that App Gateway targets).
+> With `--ingress internal` the app is reachable **only via the in-cluster service
+> mesh** (`*.internal.<envdomain>` → a non-routable `100.x` mesh IP), so App
+> Gateway gets a **404 from Envoy** and backend health never goes Healthy. With
+> `--ingress external` on an internal env, the app is published at
+> `<app>.<envdomain>` on the env's private LB static IP — still private, and now
+> reachable by App Gateway.
 
 ```bash
 FOUNDRY_PROJECT_ENDPOINT="https://${FOUNDRY_NAME}.services.ai.azure.com/api/projects/${FOUNDRY_PROJECT}"
@@ -248,7 +260,7 @@ az containerapp create \
   --registry-server "$ACR_LOGIN_SERVER" \
   --registry-identity system \
   --system-assigned \
-  --ingress internal --target-port 8080 --transport auto \
+  --ingress external --target-port 8080 --transport auto \
   --min-replicas 1 --max-replicas 3 \
   --cpu 0.5 --memory 1Gi \
   --env-vars \
@@ -282,12 +294,14 @@ FOUNDRY_ID=$(az cognitiveservices account show -g "$BACKEND_RG" -n "$FOUNDRY_NAM
 SEARCH_ID=$(az search service show -g "$BACKEND_RG" -n "$SEARCH_NAME" --query id -o tsv)
 ADLS_ID=$(az storage account show -g "$BACKEND_RG" -n "$ADLS_NAME" --query id -o tsv)
 
-# Foundry Agent Service caller + direct AOAI/embeddings
-# NOTE: "Azure AI User" is not present in every tenant. If you get
-# "Role 'Azure AI User' doesn't exist", use "Azure AI Developer" (used here),
-# which grants the data-plane actions to call/run Foundry agents.
+# Foundry Agent Service caller + connection read + direct AOAI/embeddings
+# NOTE: In this tenant the newer roles "Azure AI User" / "Azure AI Developer" are
+# a STALE generation and do NOT grant the data action the app needs to read the
+# project's connections (Microsoft.CognitiveServices/accounts/AIServices/connections/read).
+# Use "Foundry User" (data actions = Microsoft.CognitiveServices/*), which covers
+# connection read, agent run, and inference. Verified working for the agent script.
 az role assignment create --assignee-object-id "$APP_MI" --assignee-principal-type ServicePrincipal \
-  --role "Azure AI Developer" --scope "$FOUNDRY_ID"
+  --role "Foundry User" --scope "$FOUNDRY_ID"
 az role assignment create --assignee-object-id "$APP_MI" --assignee-principal-type ServicePrincipal \
   --role "Cognitive Services OpenAI User" --scope "$FOUNDRY_ID"
 
@@ -324,6 +338,43 @@ EXEC sp_addrolemember 'db_datareader', 'srgsib-app';
 
 ---
 
+## 9b. Create the environment's private DNS zone (so App Gateway can resolve the app)
+
+App Gateway resolves the backend **FQDN** via DNS. The Container Apps environment
+default domain (`*.azurecontainerapps.io`) is **not** registered in your VNet, so
+without this zone the backend health shows **`Unknown`** (DNS failure). Create a
+private DNS zone for the env default domain, point a wildcard `*` (and `@`) record
+at the env's **static IP**, and link it to the app VNet.
+
+```bash
+# Default domain + internal LB static IP of the Container Apps environment
+ENV_DOMAIN=$(az containerapp env show -g "$APP_RG" -n "$CAE_NAME" --query properties.defaultDomain -o tsv)
+ENV_IP=$(az containerapp env show -g "$APP_RG" -n "$CAE_NAME" --query properties.staticIp -o tsv)
+echo "env domain=$ENV_DOMAIN  staticIp=$ENV_IP"
+APP_VNET_ID=$(az network vnet show -g "$APP_RG" -n "$APP_VNET" --query id -o tsv)
+
+# Private DNS zone = env default domain
+az network private-dns zone create -g "$APP_RG" -n "$ENV_DOMAIN"
+
+# Link it to the app VNet (so the AGW in this VNet resolves it)
+az network private-dns link vnet create \
+  -g "$APP_RG" -z "$ENV_DOMAIN" -n "${APP_VNET}-link" \
+  -v "$APP_VNET_ID" -e false
+
+# Wildcard + apex A records -> env static (internal LB) IP.
+# '*' matches <app>.<envdomain> (the external-ingress FQDN App Gateway targets).
+az network private-dns record-set a add-record -g "$APP_RG" -z "$ENV_DOMAIN" -n "*" -a "$ENV_IP"
+az network private-dns record-set a add-record -g "$APP_RG" -z "$ENV_DOMAIN" -n "@" -a "$ENV_IP"
+```
+
+> If the app ingress were left as `internal` (Step 7), its FQDN would be
+> `<app>.internal.<envdomain>` and you'd need a `*.internal` record **and** it
+> still wouldn't work, because internal-ingress apps aren't published on the env
+> LB. Keeping the app ingress **external** (private, on an internal env) is what
+> makes the `*` record + LB static IP path work end-to-end.
+
+---
+
 ## 10. Deploy the Application Gateway (the only public surface)
 
 ```bash
@@ -334,9 +385,10 @@ az network public-ip create \
   -g "$APP_RG" -n "$AGW_PIP" -l "$LOCATION" \
   --sku Standard --allocation-method Static
 
-# Container App internal FQDN = App Gateway backend target
+# Container App FQDN = App Gateway backend target (non-.internal because the app
+# ingress is external; published on the env's private LB static IP)
 APP_FQDN=$(az containerapp show -g "$APP_RG" -n "$APP_NAME" --query properties.configuration.ingress.fqdn -o tsv)
-echo "Backend FQDN: $APP_FQDN"
+echo "Backend FQDN: $APP_FQDN"   # e.g. srgsib-app.<envdomain> (NOT *.internal.*)
 
 # WAF policy is REQUIRED for the WAF_v2 SKU. Create it first; it ships with the
 # OWASP 3.2 managed rule set (Detection mode by default — switched to Prevention
@@ -367,10 +419,12 @@ az network application-gateway create \
 ### Backend health probe + host header (point to the internal FQDN)
 
 ```bash
-# Custom probe using the backend FQDN as host
+# Custom probe using the backend FQDN as host.
+# Use /healthz (always returns 200) — path / returns 404 unless the SPA static
+# files are bundled, which would mark the backend Unhealthy.
 az network application-gateway probe create \
   -g "$APP_RG" --gateway-name "$AGW_NAME" -n aca-probe \
-  --protocol Https --host "$APP_FQDN" --path / \
+  --protocol Https --host "$APP_FQDN" --path /healthz \
   --interval 30 --timeout 30 --threshold 3
 
 az network application-gateway http-settings update \
@@ -452,6 +506,12 @@ az network nsg create -g "$APP_RG" -n "${SNET_AGW}-nsg" -l "$LOCATION"
 az network nsg rule create -g "$APP_RG" --nsg-name "${SNET_AGW}-nsg" -n allow-https \
   --priority 100 --direction Inbound --access Allow --protocol Tcp \
   --source-address-prefixes Internet --destination-port-ranges 443
+# TEMPORARY: the gateway is bootstrapped on an HTTP/80 listener (no cert yet), so
+# allow 80 to test via http://<AGW_PUBLIC_IP>/. Remove this rule once you add the
+# HTTPS/443 listener + cert (friendly-domain step above).
+az network nsg rule create -g "$APP_RG" --nsg-name "${SNET_AGW}-nsg" -n allow-http \
+  --priority 105 --direction Inbound --access Allow --protocol Tcp \
+  --source-address-prefixes Internet --destination-port-ranges 80
 az network nsg rule create -g "$APP_RG" --nsg-name "${SNET_AGW}-nsg" -n allow-gwmgr \
   --priority 110 --direction Inbound --access Allow --protocol Tcp \
   --source-address-prefixes GatewayManager --destination-port-ranges 65200-65535
@@ -490,9 +550,14 @@ az storage fs directory upload -f docs --account-name "$ADLS_NAME" \
 ## 13. Validate end-to-end
 
 ```bash
-# 1. Gateway is up and healthy
+# 1. Gateway is up and healthy.
+# NOTE: `-o table` prints NOTHING for backend-health (nested output the table
+# formatter can't flatten). Use a --query projection instead:
 az network application-gateway show-backend-health \
-  -g "$APP_RG" -n "$AGW_NAME" -o table
+  -g "$APP_RG" -n "$AGW_NAME" \
+  --query "backendAddressPools[].backendHttpSettingsCollection[].servers[].{address:address, health:health, reason:healthProbeLog}" \
+  -o json
+# Expect health = "Healthy".
 
 # 2. Public entry point
 AGW_IP=$(az network public-ip show -g "$APP_RG" -n "$AGW_PIP" --query ipAddress -o tsv)
