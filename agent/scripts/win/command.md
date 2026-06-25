@@ -60,3 +60,15 @@ sqlcmd -S "caassynapse.sql.azuresynapse.net" -d "caasedms" -G -Q $query
 $APP_FQDN = az containerapp show -g $APP_RG -n $APP_NAME --query properties.configuration.ingress.fqdn -o tsv
 Write-Host "App FQDN: $APP_FQDN"
 az containerapp logs show -g $APP_RG -n $APP_NAME --tail 50
+
+# Resync Github Repo
+
+cd C:\path\to\SafetyRegulation
+git fetch origin
+git reset --hard origin/main
+git log --oneline -3
+git status
+
+# git reset --hard origin/main → never touches untracked folders like .venv. Safe. 
+# git clean -fd → deletes untracked files. This is the only risky part: it removes .venv only # if .venv is not gitignored.
+# Safest approach — skip git clean entirely (you don't need it just to update to the latest code):
