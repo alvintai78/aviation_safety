@@ -22,6 +22,17 @@ function parseMaybeJSON(v: unknown): unknown {
   }
 }
 
+// crypto.randomUUID() is only defined in secure contexts (HTTPS or http://localhost).
+// Fall back to a non-crypto id so the app still works over plain HTTP (e.g. while
+// the gateway is on a temporary HTTP listener before TLS is configured).
+function generateId(): string {
+  const c = globalThis.crypto;
+  if (c && typeof c.randomUUID === "function") {
+    return c.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function isTableArtifact(spec: unknown): spec is { type: "table"; rows?: unknown[] } {
   return Boolean(spec && typeof spec === "object" && (spec as { type?: string }).type === "table");
 }
@@ -107,7 +118,7 @@ export default function App() {
   const [traces, setTraces] = useState<ToolTrace[]>([]);
   const [charts, setCharts] = useState<ChartArtifact[]>([]);
   const [busy, setBusy] = useState(false);
-  const sessionId = useMemo(() => `web-${crypto.randomUUID()}`, []);
+  const sessionId = useMemo(() => `web-${generateId()}`, []);
   const seqRef = useRef(0);
   const nextId = () => `${Date.now()}-${++seqRef.current}`;
 
