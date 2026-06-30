@@ -20,11 +20,23 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent import run_chat_stream
 from mock_chat import run_mock_chat_stream
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("safety-intel-bot")
+
+# Import the real agent lazily so an import-time failure (e.g. pyodbc / ODBC
+# driver, missing Azure deps) does NOT crash uvicorn before it can bind the
+# port. Instead we capture the error and surface it via /readyz and /chat, so
+# the container starts, the startup probe passes, and the logs show the cause.
+_AGENT_IMPORT_ERROR: str | None = None
+try:
+    from agent import run_chat_stream
+except Exception as _e:  # noqa: BLE001
+    run_chat_stream = None  # type: ignore[assignment]
+    _AGENT_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+    log.exception("Failed to import agent module at startup")
+
 
 app = FastAPI(title="Safety Intelligence Bot")
 
@@ -54,6 +66,13 @@ async def readyz() -> dict[str, str]:
     if _demo_mode_enabled():
         return {"status": "ready", "agent_name": "demo-mode"}
 
+    if _AGENT_IMPORT_ERROR is not None:
+        raise HTTPException(
+            503,
+            f"Agent module failed to import at startup: {_AGENT_IMPORT_ERROR}. "
+            "Check the container logs for the full traceback.",
+        )
+
     name = os.environ.get("FOUNDRY_AGENT_NAME")
     if not name:
         raise HTTPException(
@@ -71,7 +90,14 @@ async def chat(body: ChatIn):
 
     async def stream():
         try:
-            runner = run_mock_chat_stream if _demo_mode_enabled() else run_chat_stream
+            if _demo_mode_enabled():
+                runner = run_mock_chat_stream
+            elif run_chat_stream is None:
+                raise RuntimeError(
+                    f"Agent module unavailable: {_AGENT_IMPORT_ERROR}"
+                )
+            else:
+                runner = run_chat_stream
             async for event in runner(body.session_id, body.message):
                 yield f"data: {json.dumps(event)}\n\n"
                 await asyncio.sleep(0)

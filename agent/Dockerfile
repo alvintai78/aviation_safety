@@ -32,5 +32,8 @@ RUN rm -rf /app/web
 COPY --from=web /static /app/static
 
 ENV PORT=8080
+# Unbuffered stdout/stderr so startup errors are flushed to the container logs
+# immediately (otherwise a crash during import loses all buffered output).
+ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "debug"]
