@@ -15,9 +15,9 @@ Vite + React + TypeScript SPA that talks to the FastAPI backend (`agent/app.py`)
 ```bash
 cd agent/web
 npm install
-npm run dev          # http://localhost:5173, proxies /chat to :8080
+npm run dev          # http://localhost:5173, proxies /chat to :7700
 # In another terminal:
-cd agent && uvicorn app:app --reload --port 8080
+cd agent && uvicorn app:app --reload --port 7700
 ```
 
 ## Build for production

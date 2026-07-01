@@ -122,7 +122,7 @@ az containerapp create `
   --registry-server $AcrLoginServer `
   --registry-identity system `
   --system-assigned `
-  --ingress external --target-port 8080 --transport auto `
+  --ingress external --target-port 7700 --transport auto `
   --min-replicas 1 --max-replicas 3 `
   --cpu 0.5 --memory 1Gi `
   --env-vars @envVars
@@ -166,7 +166,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-
+pipi 
 cd C:\Users\alvintai\aviation_safety
 python agent/scripts/create_foundry_agent.py
 ```

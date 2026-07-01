@@ -39,7 +39,7 @@ export SYNAPSE_SQL_SERVER="<workspace>.sql.azuresynapse.net"
 export SYNAPSE_SQL_DATABASE="SafetyRegulationDM"
 export SEARCH_ENDPOINT="https://<your-search>.search.windows.net"
 export SEARCH_INDEX="safety-docs"
-uvicorn app:app --reload --port 8080
+uvicorn app:app --reload --port 7700
 ```
 
 To refresh the Foundry-specific local env file directly from the known ARM deployment:

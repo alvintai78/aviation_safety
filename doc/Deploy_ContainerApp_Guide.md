@@ -260,7 +260,7 @@ az containerapp create \
   --registry-server "$ACR_LOGIN_SERVER" \
   --registry-identity system \
   --system-assigned \
-  --ingress external --target-port 8080 --transport auto \
+  --ingress external --target-port 7700 --transport auto \
   --min-replicas 1 --max-replicas 3 \
   --cpu 0.5 --memory 1Gi \
   --env-vars \
@@ -280,10 +280,10 @@ APP_MI=$(az containerapp show -g "$APP_RG" -n "$APP_NAME" --query identity.princ
 echo "Container App MI principalId: $APP_MI"
 ```
 
-> `--target-port 8080` matches the container's listening port (`uvicorn ... --port
-> 8080` / `EXPOSE 8080` in [agent/Dockerfile](../Dockerfile)). App Gateway still
+> `--target-port 7700` matches the container's listening port (`uvicorn ... --port
+> 7700` / `EXPOSE 7700` in [agent/Dockerfile](../Dockerfile)). App Gateway still
 > talks to the Container App's internal FQDN over HTTPS 443; ingress maps that to
-> 8080 inside the container.
+> 7700 inside the container.
 
 ---
 

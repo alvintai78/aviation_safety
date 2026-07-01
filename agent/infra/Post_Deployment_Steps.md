@@ -205,9 +205,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
-ENV PORT=8080
-EXPOSE 8080
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+ENV PORT=7700
+EXPOSE 7700
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7700"]
 EOF
 ```
 
@@ -283,7 +283,7 @@ az containerapp update \
 # 4c. Open the right port
 az containerapp ingress update \
   -g "$RG" -n "$APP_NAME" \
-  --target-port 8080 --type external --transport auto
+  --target-port 7700 --type external --transport auto
 ```
 
 Tail logs and confirm `Agent built; tools=['nl2sql', 'doc_search', 'chart_spec']`:
@@ -304,7 +304,7 @@ curl -sS "https://${APP_FQDN}/healthz"
 
 ## 5. (Optional) Re-bake the Bicep so it stops resetting the image
 
-After the first successful deploy, change `agentContainerImage` in `agent/infra/main.bicepparam` to `"<acrLoginServer>/safety-intel-bot:v1"` and `agentContainerPort` to `8080`, so the next `deploy.sh` doesn't revert to hello-world.
+After the first successful deploy, change `agentContainerImage` in `agent/infra/main.bicepparam` to `"<acrLoginServer>/safety-intel-bot:v1"` and `agentContainerPort` to `7700`, so the next `deploy.sh` doesn't revert to hello-world.
 
 ---
 

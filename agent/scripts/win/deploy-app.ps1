@@ -189,7 +189,7 @@ if ([string]::IsNullOrWhiteSpace($appExists)) {
         --registry-server $AcrLoginServer `
         --registry-identity system `
         --system-assigned `
-        --ingress external --target-port 8080 --transport auto `
+        --ingress external --target-port 7700 --transport auto `
         --min-replicas 1 --max-replicas 3 `
         --cpu 0.5 --memory 1Gi `
         --env-vars @envVars

@@ -11,9 +11,9 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/chat": { target: "http://localhost:8080", changeOrigin: true },
-      "/healthz": "http://localhost:8080",
-      "/readyz": "http://localhost:8080",
+      "/chat": { target: "http://localhost:7700", changeOrigin: true },
+      "/healthz": "http://localhost:7700",
+      "/readyz": "http://localhost:7700",
     },
   },
 });
